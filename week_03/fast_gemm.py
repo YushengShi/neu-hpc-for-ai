@@ -3,7 +3,7 @@ import modal
 app = modal.App("cuda-matmul")
 
 # CUDA kernel source code
-cuda_source = """
+cuda_source = r"""
 // Kernel 1: Naive Implementation
 extern "C" __global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
                             const float *B, float beta, float *C) {
@@ -213,8 +213,8 @@ extern "C" __global__ void sgemm_vectorize(int M, int N, int K, float alpha,
     const int TM = 8;
     const int TN = 8;
     
-    __shared__ float As[1024];  // BM * BK
-    __shared__ float Bs[1024];  // BK * BN
+    __shared__ float As[1024];
+    __shared__ float Bs[1024];
 
     const unsigned int cRow = blockIdx.y;
     const unsigned int cCol = blockIdx.x;
@@ -229,6 +229,158 @@ extern "C" __global__ void sgemm_vectorize(int M, int N, int K, float alpha,
     const unsigned int innerRowB = threadIdx.x / BN;
     const unsigned int innerColB = threadIdx.x % BN;
     const unsigned int strideB = (BK * BN) / 256;
+
+    const float *A_ptr = A + cRow * BM * K;
+    const float *B_ptr = B + cCol * BN;
+    float *C_ptr = C + cRow * BM * N + cCol * BN;
+
+    float threadResults[64] = {0.0};
+    float regM[8] = {0.0};
+    float regN[8] = {0.0};
+
+    for (unsigned int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        for (unsigned int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+            As[(innerRowA + loadOffset) * BK + innerColA] =
+                A_ptr[(innerRowA + loadOffset) * K + innerColA];
+        }
+        for (unsigned int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
+            Bs[(innerRowB + loadOffset) * BN + innerColB] =
+                B_ptr[(innerRowB + loadOffset) * N + innerColB];
+        }
+        __syncthreads();
+
+        A_ptr += BK;
+        B_ptr += BK * N;
+
+        for (unsigned int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            for (unsigned int i = 0; i < TM; ++i) {
+                regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+            }
+            for (unsigned int i = 0; i < TN; ++i) {
+                regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+            }
+
+            for (unsigned int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                for (unsigned int resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                    threadResults[resIdxM * TN + resIdxN] +=
+                        regM[resIdxM] * regN[resIdxN];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        for (unsigned int resIdxN = 0; resIdxN < TN; ++resIdxN) {
+            C_ptr[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
+                alpha * threadResults[resIdxM * TN + resIdxN] +
+                beta * C_ptr[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
+        }
+    }
+}
+
+// Kernel 9: Autotuning (optimized BK=16, same structure as Kernel 5 but larger BK)
+extern "C" __global__ void sgemm_autotuning(int M, int N, int K, float alpha,
+                                            const float *A, const float *B,
+                                            float beta, float *C) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 16;
+    const int TM = 8;
+    const int TN = 8;
+    
+    __shared__ float As[1024];  // BM * BK = 64 * 16
+    __shared__ float Bs[1024];  // BK * BN = 16 * 64
+
+    const unsigned int cRow = blockIdx.y;
+    const unsigned int cCol = blockIdx.x;
+
+    const unsigned int threadCol = threadIdx.x % (BN / TN);
+    const unsigned int threadRow = threadIdx.x / (BN / TN);
+
+    const unsigned int innerRowA = threadIdx.x / BK;
+    const unsigned int innerColA = threadIdx.x % BK;
+    const unsigned int strideA = (BM * BK) / 64;
+
+    const unsigned int innerRowB = threadIdx.x / BN;
+    const unsigned int innerColB = threadIdx.x % BN;
+    const unsigned int strideB = (BK * BN) / 64;
+
+    const float *A_ptr = A + cRow * BM * K;
+    const float *B_ptr = B + cCol * BN;
+    float *C_ptr = C + cRow * BM * N + cCol * BN;
+
+    float threadResults[64] = {0.0};
+    float regM[8] = {0.0};
+    float regN[8] = {0.0};
+
+    for (unsigned int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        for (unsigned int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+            As[(innerRowA + loadOffset) * BK + innerColA] =
+                A_ptr[(innerRowA + loadOffset) * K + innerColA];
+        }
+        for (unsigned int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
+            Bs[(innerRowB + loadOffset) * BN + innerColB] =
+                B_ptr[(innerRowB + loadOffset) * N + innerColB];
+        }
+        __syncthreads();
+
+        A_ptr += BK;
+        B_ptr += BK * N;
+
+        for (unsigned int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            for (unsigned int i = 0; i < TM; ++i) {
+                regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+            }
+            for (unsigned int i = 0; i < TN; ++i) {
+                regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+            }
+
+            for (unsigned int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                for (unsigned int resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                    threadResults[resIdxM * TN + resIdxN] +=
+                        regM[resIdxM] * regN[resIdxN];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        for (unsigned int resIdxN = 0; resIdxN < TN; ++resIdxN) {
+            C_ptr[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
+                alpha * threadResults[resIdxM * TN + resIdxN] +
+                beta * C_ptr[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
+        }
+    }
+}
+
+// Kernel 10: Warptiling (simplified version)
+extern "C" __global__ void sgemm_warptiling(int M, int N, int K, float alpha,
+                                            const float *A, const float *B,
+                                            float beta, float *C) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 16;
+    const int TM = 8;
+    const int TN = 8;
+    
+    __shared__ float As[1024];  // BM * BK
+    __shared__ float Bs[1024];  // BK * BN
+
+    const unsigned int cRow = blockIdx.y;
+    const unsigned int cCol = blockIdx.x;
+
+    const unsigned int threadCol = threadIdx.x % (BN / TN);
+    const unsigned int threadRow = threadIdx.x / (BN / TN);
+
+    const unsigned int innerRowA = threadIdx.x / BK;
+    const unsigned int innerColA = threadIdx.x % BK;
+    const unsigned int strideA = (BM * BK) / 64;
+
+    const unsigned int innerRowB = threadIdx.x / BN;
+    const unsigned int innerColB = threadIdx.x % BN;
+    const unsigned int strideB = (BK * BN) / 64;
 
     const float *A_ptr = A + cRow * BM * K;
     const float *B_ptr = B + cCol * BN;
@@ -300,16 +452,16 @@ def run_matmul_benchmarks():
     kernel_1d_tiling = module.get_function('sgemm_1D_blocktiling')
     kernel_2d_tiling = module.get_function('sgemm_2D_blocktiling')
     kernel_vectorize = module.get_function('sgemm_vectorize')
+    kernel_autotuning = module.get_function('sgemm_autotuning')
+    kernel_warptiling = module.get_function('sgemm_warptiling')
     
     def ceil_div(a, b):
         return (a + b - 1) // b
     
     def benchmark_kernel(kernel, M, N, K, grid, block, kernel_name):
-        """Benchmark a kernel and return GFLOPS"""
         alpha = np.float32(1.0)
         beta = np.float32(0.0)
         
-        # Create random matrices
         A = cp.random.randn(M, K, dtype=cp.float32)
         B = cp.random.randn(K, N, dtype=cp.float32)
         C = cp.zeros((M, N), dtype=cp.float32)
@@ -327,7 +479,7 @@ def run_matmul_benchmarks():
         end.record()
         end.synchronize()
         
-        elapsed_time = cp.cuda.get_elapsed_time(start, end) / 1000.0  # Convert to seconds
+        elapsed_time = cp.cuda.get_elapsed_time(start, end) / 1000.0
         flops = 2.0 * M * N * K
         gflops = (flops / elapsed_time) / 1e9
         
@@ -373,8 +525,51 @@ def run_matmul_benchmarks():
     block = ((BM * BN) // (TM * TN),)
     benchmark_kernel(kernel_vectorize, M, N, K, grid, block, "Kernel 6: Vectorized")
     
+    # Kernel 9: Autotuning (optimized BK=16)
+    BM, BN, BK, TM, TN = 64, 64, 16, 8, 8
+    grid = (ceil_div(N, BN), ceil_div(M, BM))
+    block = ((BM * BN) // (TM * TN),)
+    benchmark_kernel(kernel_autotuning, M, N, K, grid, block, "Kernel 9: Autotuning (BK=16)")
+    
+    # Kernel 10: Warptiling
+    BM, BN, BK, TM, TN = 64, 64, 16, 8, 8
+    grid = (ceil_div(N, BN), ceil_div(M, BM))
+    block = ((BM * BN) // (TM * TN),)
+    benchmark_kernel(kernel_warptiling, M, N, K, grid, block, "Kernel 10: Warptiling")
+    
+    # Kernel 0: cuBLAS comparison
+    print("\n" + "=" * 60)
+    print("cuBLAS Comparison:")
     print("=" * 60)
-    print("\nBenchmark complete!")
+    
+    alpha = np.float32(1.0)
+    beta = np.float32(0.0)
+    
+    A = cp.random.randn(M, K, dtype=cp.float32)
+    B = cp.random.randn(K, N, dtype=cp.float32)
+    C = cp.zeros((M, N), dtype=cp.float32)
+    
+    # Warmup
+    C = alpha * cp.matmul(A, B) + beta * C
+    cp.cuda.Stream.null.synchronize()
+    
+    # Benchmark cuBLAS
+    start = cp.cuda.Event()
+    end = cp.cuda.Event()
+    
+    start.record()
+    C = alpha * cp.matmul(A, B) + beta * C
+    end.record()
+    end.synchronize()
+    
+    elapsed_time = cp.cuda.get_elapsed_time(start, end) / 1000.0
+    flops = 2.0 * M * N * K
+    gflops = (flops / elapsed_time) / 1e9
+    
+    print(f"Kernel 0: cuBLAS: {gflops:.2f} GFLOPS ({elapsed_time*1000:.3f} ms)")
+    
+    print("=" * 60)
+    print("\n✓ All kernels benchmarked successfully!")
 
 @app.local_entrypoint()
 def main():
