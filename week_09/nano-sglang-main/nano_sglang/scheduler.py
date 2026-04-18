@@ -59,7 +59,7 @@ class Scheduler:
         still_running = []
         for seq, token in zip(self.running, next_tokens):
             seq.output_token_ids.append(token)
-            if token == eos_id or seq.num_generated >= seq.max_tokens:
+            if token == eos_id or seq.num_generated >= min(seq.max_tokens, sampling_params.max_tokens):
                 seq.status = SequenceStatus.FINISHED
                 self.finished.append(seq)
             else:

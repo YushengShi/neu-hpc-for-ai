@@ -1,7 +1,7 @@
 """Model wrapper for Qwen3."""
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, DynamicCache
 
 
 class Model:
@@ -23,6 +23,8 @@ class Model:
     @torch.no_grad()
     def forward(self, input_ids: torch.Tensor, past_key_values=None,
                 position_ids=None, attention_mask=None):
+        if past_key_values is None:
+            past_key_values = DynamicCache()
         outputs = self.model(
             input_ids=input_ids,
             past_key_values=past_key_values,

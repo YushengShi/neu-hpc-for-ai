@@ -16,9 +16,23 @@ def download_model():
     snapshot_download(MODEL_NAME)
 
 
+# image = (
+#     modal.Image.debian_slim(python_version="3.11")
+#     .pip_install("torch", "transformers", "huggingface_hub", "pytest", "accelerate")
+#     .run_function(download_model)
+#     .add_local_dir("nano_sglang", remote_path="/root/nano_sglang")
+#     .add_local_dir("tests", remote_path="/root/tests")
+# )
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "huggingface_hub", "pytest", "accelerate")
+    .pip_install(
+        "torch",
+        "transformers==4.57.1",
+        "huggingface_hub",
+        "pytest",
+        "accelerate",
+    )
     .run_function(download_model)
     .add_local_dir("nano_sglang", remote_path="/root/nano_sglang")
     .add_local_dir("tests", remote_path="/root/tests")

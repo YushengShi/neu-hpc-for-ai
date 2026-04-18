@@ -7,7 +7,7 @@ Two phases:
 
 import torch
 import torch.nn.functional as F
-from transformers.cache_utils import DynamicCache
+from transformers import DynamicCache
 from .model import Model, Tokenizer
 from .sampling import SamplingParams, sample_token
 from .sequence import Sequence, SequenceStatus
@@ -20,8 +20,7 @@ class Engine:
         self.device = device
 
     def prefill(self, seq: Sequence, sampling_params: SamplingParams) -> int:
-        """Process all prompt tokens in one forward pass, return first generated token.
-        Should also store past_key_values in seq and set status to DECODING."""
+        """Process all prompt tokens in one forward pass, return first generated token."""
         input_ids = torch.tensor([seq.prompt_token_ids], device=self.device)
         logits, past_key_values = self.model.forward(input_ids)
         next_token = sample_token(logits[:, -1, :], sampling_params).item()
@@ -53,20 +52,30 @@ class Engine:
         cache_lens = [seq.past_key_values.get_seq_length() for seq in sequences]
         max_len = max(cache_lens)
 
-        batched_cache = DynamicCache()
-        for layer_idx in range(self.model.num_layers):
+        # Use to_legacy_cache() to extract tensors, build batched cache, then convert back
+        # Legacy format: tuple of (key, value) tuples per layer,
+        # each tensor shape [batch, heads, seq_len, head_dim]
+        legacy_caches = [seq.past_key_values.to_legacy_cache() for seq in sequences]
+        num_layers = len(legacy_caches[0])
+
+        batched_legacy = []
+        for layer_idx in range(num_layers):
             padded_keys, padded_values = [], []
-            for seq in sequences:
-                k = seq.past_key_values.key_cache[layer_idx]
-                v = seq.past_key_values.value_cache[layer_idx]
-                pad = max_len - k.shape[2]
+            for i, lc in enumerate(legacy_caches):
+                k = lc[layer_idx][0]  # [1, heads, seq_len, head_dim]
+                v = lc[layer_idx][1]
+                pad = max_len - cache_lens[i]
                 if pad > 0:
                     k = F.pad(k, (0, 0, pad, 0))
                     v = F.pad(v, (0, 0, pad, 0))
                 padded_keys.append(k)
                 padded_values.append(v)
-            batched_cache.key_cache.append(torch.cat(padded_keys, dim=0))
-            batched_cache.value_cache.append(torch.cat(padded_values, dim=0))
+            batched_legacy.append((
+                torch.cat(padded_keys, dim=0),
+                torch.cat(padded_values, dim=0),
+            ))
+
+        batched_cache = DynamicCache.from_legacy_cache(tuple(batched_legacy))
 
         attn_mask = torch.zeros(n, max_len + 1, device=self.device, dtype=torch.long)
         for i, cl in enumerate(cache_lens):
@@ -81,21 +90,22 @@ class Engine:
 
         tokens = sample_token(logits[:, -1, :], sampling_params)
 
+        # Split batched cache back into per-sequence caches
+        new_legacy = new_cache.to_legacy_cache()
         for i, seq in enumerate(sequences):
             real_len = cache_lens[i] + 1
             pad = max_len - cache_lens[i]
-            per_seq_cache = DynamicCache()
-            for layer_idx in range(self.model.num_layers):
-                k = new_cache.key_cache[layer_idx][i:i+1, :, pad:pad + real_len, :]
-                v = new_cache.value_cache[layer_idx][i:i+1, :, pad:pad + real_len, :]
-                per_seq_cache.key_cache.append(k.clone())
-                per_seq_cache.value_cache.append(v.clone())
-            seq.past_key_values = per_seq_cache
+            per_seq_legacy = []
+            for layer_idx in range(num_layers):
+                k = new_legacy[layer_idx][0][i:i+1, :, pad:pad + real_len, :]
+                v = new_legacy[layer_idx][1][i:i+1, :, pad:pad + real_len, :]
+                per_seq_legacy.append((k.clone(), v.clone()))
+            seq.past_key_values = DynamicCache.from_legacy_cache(tuple(per_seq_legacy))
 
         return [t.item() for t in tokens]
 
     def generate(self, prompt: str, sampling_params: SamplingParams = None) -> str:
-        """Generate text for a single prompt. Wire prefill + decode loop together."""
+        """Generate text for a single prompt."""
         if sampling_params is None:
             sampling_params = SamplingParams()
 
@@ -107,11 +117,13 @@ class Engine:
 
         first_token = self.prefill(seq, sampling_params)
         seq.output_token_ids.append(first_token)
+        seq.status = SequenceStatus.DECODING
 
         eos_id = self.tokenizer.eos_token_id
         while (len(seq.output_token_ids) < sampling_params.max_tokens
-            and seq.output_token_ids[-1] != eos_id):
+               and seq.output_token_ids[-1] != eos_id):
             next_token = self.decode_step(seq, sampling_params)
             seq.output_token_ids.append(next_token)
 
+        seq.status = SequenceStatus.FINISHED
         return self.tokenizer.decode(seq.output_token_ids)
