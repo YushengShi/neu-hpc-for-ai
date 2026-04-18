@@ -11,7 +11,7 @@ image = (
     modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel")
     .apt_install("git", "build-essential")
     .pip_install("transformers", "numpy>=1.26.0")
-    .run_commands("echo 'v9'")   # bump to bust cache
+    .run_commands("echo 'v10'")   # bump to bust cache
 )
 
 KERNELS_CUH   = '#pragma once\n#include <cuda_runtime.h>\n#include <math.h>\n\n// ---------------------------------------------------------------------------\n// Elementwise SiLU in-place\n// ---------------------------------------------------------------------------\n__global__ void kernel_silu(float* x, int n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));\n}\n\n// ---------------------------------------------------------------------------\n// Row-major matvec:  y[r] = sum_c W[r,c] * x[c]\n// ---------------------------------------------------------------------------\n__global__ void kernel_matvec(\n    const float* __restrict__ W,   // [rows, cols]\n    const float* __restrict__ x,   // [cols]\n    float*       y,                // [rows]\n    int rows, int cols\n) {\n    int r = blockIdx.x * blockDim.x + threadIdx.x;\n    if (r >= rows) return;\n    double acc = 0.0;\n    for (int c = 0; c < cols; c++)\n        acc += (double)W[r * cols + c] * (double)x[c];\n    y[r] = (float)acc;\n}\n\n// ---------------------------------------------------------------------------\n// Elementwise multiply:  c[i] = a[i] * b[i]\n// ---------------------------------------------------------------------------\n__global__ void kernel_elemwise_mul(\n    const float* __restrict__ a,\n    const float* __restrict__ b,\n    float* c, int n\n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) c[i] = a[i] * b[i];\n}\n\n// ---------------------------------------------------------------------------\n// Weighted accumulate:  out[h] += weight * src[h]\n// ---------------------------------------------------------------------------\n__global__ void kernel_weighted_add(\n    float*       out,\n    const float* src,\n    float        weight,\n    int H\n) {\n    int h = blockIdx.x * blockDim.x + threadIdx.x;\n    if (h < H) out[h] += weight * src[h];\n}\n\n// ---------------------------------------------------------------------------\n// Elementwise add:  c[i] = a[i] + b[i]\n// ---------------------------------------------------------------------------\n__global__ void kernel_add(\n    const float* __restrict__ a,\n    const float* __restrict__ b,\n    float* c, int n\n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) c[i] = a[i] + b[i];\n}\n\n// ---------------------------------------------------------------------------\n// Gate scores:  scores[t,e] = sigmoid( gate_weight[e] dot x[t] )\n// Launch: grid(T, ceil(E/BLOCK)), block(BLOCK)\n// ---------------------------------------------------------------------------\n__global__ void kernel_gate_scores(\n    const float* __restrict__ x,           // [T, H]\n    const float* __restrict__ gate_weight, // [E, H]\n    float*       scores,                   // [T, E]\n    int T, int H, int E\n) {\n    int t = blockIdx.x;\n    int e = blockIdx.y * blockDim.x + threadIdx.x;\n    if (t >= T || e >= E) return;\n\n    const float* xt = x + (long)t * H;\n    const float* we = gate_weight + (long)e * H;\n    double acc = 0.0;\n    for (int h = 0; h < H; h++)\n        acc += (double)xt[h] * (double)we[h];\n    scores[(long)t * E + e] = 1.0f / (1.0f + expf(-(float)acc));\n}\n\n// ---------------------------------------------------------------------------\n// Top-K + weight normalization.  One thread per token.\n// ---------------------------------------------------------------------------\n#define MAX_EXPERTS_TOPK 128\n#define MAX_TOPK_K        32\n\n__global__ void kernel_topk(\n    const float* __restrict__ scores,  // [T, E]\n    int*   topk_idx,                   // [T, K]\n    float* topk_weight,                // [T, K]\n    int T, int E, int K,\n    float routed_scaling_factor\n) {\n    int t = blockIdx.x * blockDim.x + threadIdx.x;\n    if (t >= T) return;\n\n    const float* s = scores + (long)t * E;\n\n    // selection-sort top-K  (K ≤ 32, E ≤ 128 → fast enough)\n    int   order[MAX_TOPK_K];\n    float best [MAX_TOPK_K];\n    bool  used [MAX_EXPERTS_TOPK];\n    for (int e = 0; e < E; e++) used[e] = false;\n\n    for (int k = 0; k < K; k++) {\n        float bv = -1.f;\n        int   bi = -1;\n        for (int e = 0; e < E; e++) {\n            if (!used[e] && (s[e] > bv || (s[e] == bv && (bi < 0 || e < bi)))) {\n                bv = s[e]; bi = e;\n            }\n        }\n        order[k] = bi;\n        best[k]  = bv;\n        used[bi] = true;\n    }\n\n    double denom = 0.0;\n    for (int k = 0; k < K; k++) denom += best[k];\n    if (denom < 1e-20) denom = 1e-20;\n\n    for (int k = 0; k < K; k++) {\n        topk_idx   [(long)t * K + k] = order[k];\n        topk_weight[(long)t * K + k] = (float)((best[k] / denom) * routed_scaling_factor);\n    }\n}\n'
@@ -90,11 +90,24 @@ def run_moe(num_gpus: int = 2):
         T2     = flat_x.shape[0]
 
         with torch.no_grad():
-            # Gate: sigmoid scores, top-K, normalize
-            scores       = torch.sigmoid(flat_x @ gw.t())           # [T, E]
-            topk_scores, topk_idx = torch.topk(scores, K2, dim=-1)  # [T, K]
-            denom        = topk_scores.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-            topk_weight  = (topk_scores / denom) * scale             # [T, K]
+            # Gate: sigmoid scores, top-K via selection-sort (matches CUDA kernel_topk exactly)
+            scores = torch.sigmoid(flat_x @ gw.t())   # [T, E]
+            T2_, E_ = scores.shape
+            topk_idx    = torch.zeros(T2_, K2, dtype=torch.long)
+            topk_scores = torch.zeros(T2_, K2)
+            for t in range(T2_):
+                used = [False] * E_
+                for k in range(K2):
+                    bv, bi = -1.0, -1
+                    for e in range(E_):
+                        sv = scores[t, e].item()
+                        if not used[e] and (sv > bv or (sv == bv and (bi < 0 or e < bi))):
+                            bv, bi = sv, e
+                    topk_idx[t, k]    = bi
+                    topk_scores[t, k] = bv
+                    used[bi] = True
+            denom       = topk_scores.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+            topk_weight = (topk_scores / denom) * scale
 
             # Shared experts (safe to call directly)
             shared_out   = moe.shared_experts(x).view(T2, H).float()
@@ -171,8 +184,6 @@ def run_moe(num_gpus: int = 2):
     # ------------------------------------------------------------------ #
     # Compile
     # ------------------------------------------------------------------ #
-    nccl_inc, nccl_lib = _find_nccl()
-
     def heartbeat(label, stop_event):
         """Print a dot every 10s so Modal logs show the process is alive."""
         import threading
@@ -184,41 +195,32 @@ def run_moe(num_gpus: int = 2):
                 print(f"  [{label}] still running... {elapsed}s", flush=True)
 
     def compile_cu(src_file, out_file, use_nccl=True):
-        import glob, subprocess as sp, threading
-        out_file = Path(out_file)   # ensure Path
+        import subprocess as sp, threading
+        out_file = Path(out_file)
         stop = threading.Event()
         t = threading.Thread(target=heartbeat, args=(src_file.name, stop), daemon=True)
         t.start()
-
-        cmd = ["nvcc", "-O2", "-std=c++14", "-I", str(work), str(src_file), "-o", str(out_file)]
-
-        # Only moe_multi_gpu needs NCCL
-        if use_nccl and "multi" in src_file.name:
-            nccl_h  = glob.glob("/**/nccl.h",     recursive=True)
-            nccl_so = glob.glob("/**/libnccl.so*", recursive=True)
-            print(f"  nccl.h={nccl_h[:1]}  libnccl.so={nccl_so[:1]}", flush=True)
-            if nccl_h:  cmd = ["nvcc", "-O2", "-std=c++14",
-                                "-I", str(work), "-I", os.path.dirname(nccl_h[0]),
-                                str(src_file),
-                                f"-L{os.path.dirname(nccl_so[0]) if nccl_so else '/usr/local/cuda/lib64'}",
-                                f"-Wl,-rpath,{os.path.dirname(nccl_so[0]) if nccl_so else '/usr/local/cuda/lib64'}",
-                                "-lnccl", "-o", str(out_file)]
-
+        # Hardcoded NCCL paths for pytorch/pytorch:2.4.0-cuda12.1 — avoids slow glob
+        NCCL_INC = "/usr/local/cuda/include"
+        NCCL_LIB = "/usr/local/cuda/lib64"
+        if "multi" in src_file.name:
+            cmd = ["nvcc", "-O2", "-std=c++14",
+                   "-I", str(work), "-I", NCCL_INC,
+                   str(src_file),
+                   f"-L{NCCL_LIB}",
+                   "-lnccl", "-o", str(out_file)]
+        else:
+            cmd = ["nvcc", "-O2", "-std=c++14",
+                   "-I", str(work), str(src_file), "-o", str(out_file)]
         print(f"  $ {' '.join(cmd)}", flush=True)
         r = sp.run(cmd, cwd=str(work), capture_output=True, text=True)
-        print(r.stdout, flush=True)
-        print(r.stderr, flush=True)
         stop.set()
+        if r.stdout: print(r.stdout, flush=True)
+        if r.stderr: print(r.stderr, flush=True)
         if r.returncode != 0 or not out_file.exists():
-            raise RuntimeError(
-                f"Compile failed for {src_file.name}\n"
-                f"returncode={r.returncode}  binary_exists={out_file.exists()}\n"
-                f"STDOUT: {r.stdout}\nSTDERR: {r.stderr}"
-            )
-        print(f"  {src_file.name} ✓  ({out_file})", flush=True)
+            raise RuntimeError(f"Compile failed: {src_file.name}\nrc={r.returncode}\n{r.stderr}")
+        print(f"  {src_file.name} ✓", flush=True)
 
-
-    print("Compiling CUDA binaries...", flush=True)
     compile_cu(work / "moe_single_gpu.cu", work / "moe_single_gpu")
     compile_cu(work / "moe_multi_gpu.cu",  work / "moe_multi_gpu")
     print()
@@ -230,7 +232,7 @@ def run_moe(num_gpus: int = 2):
         for rank in range(num_gpus):
             env = os.environ.copy()
             env["RANK"] = str(rank); env["WORLD_SIZE"] = str(num_gpus)
-            if nccl_lib: env["LD_LIBRARY_PATH"] = f"{nccl_lib}:{env.get('LD_LIBRARY_PATH','')}"
+            env["LD_LIBRARY_PATH"] = f"/usr/local/cuda/lib64:{env.get('LD_LIBRARY_PATH','')}"
             ps.append(subprocess.Popen([str(work/"moe_multi_gpu"), str(test_file)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env))
         return [(p.communicate(timeout=120)) + (p.returncode,) for p in ps]
@@ -242,8 +244,8 @@ def run_moe(num_gpus: int = 2):
     print("STEP 11a — Single-GPU Correctness")
     print("=" * 60)
     r1 = subprocess.run([str(work/"moe_single_gpu"), str(tests_path)], capture_output=True, text=True)
-    for line in r1.stdout.strip().splitlines(): print(f"  {line}")
-    if r1.stderr: print(f"  STDERR: {r1.stderr[:300]}")
+    print(r1.stdout)
+    if r1.stderr: print("STDERR:", r1.stderr[:500])
     single_ok = r1.returncode == 0
     print(f"  → {'ALL PASS ✓' if single_ok else 'SOME FAILURES ✗'}\n")
 
