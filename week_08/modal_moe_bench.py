@@ -1,443 +1,506 @@
-# modal_moe_bench.py  –  single file, no separate .cu needed
-# Run with:  modal run modal_moe_bench.py
+# modal_moe_bench.py
+# Week 9: DeepSeekMoE — cuBLAS GemmEx (tensor cores) vs naive, on B200
+# Run with: modal run modal_moe_bench.py
 
 import modal
+import base64 as _b64
 
-# ---------------------------------------------------------------------------
-# Embed the CUDA source inline so there is no external file dependency
-# ---------------------------------------------------------------------------
 CUDA_SRC = r"""
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <mma.h>
-#include <cooperative_groups.h>
+#include <cublas_v2.h>
+#include <curand.h>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <vector>
 #include <numeric>
 #include <algorithm>
 #include <functional>
-#include <chrono>
 
-namespace cg = cooperative_groups;
-using namespace nvcuda::wmma;
+using bf16 = __nv_bfloat16;
 
 // ---------------------------------------------------------------------------
-// Config
+// Dims — kept small enough to fit in Modal's 64 GB CPU RAM + 192 GB GPU HBM.
+// E=16: weights = 3*16*18432*7168*2 = 12.7 GB GPU, 0 GB CPU (GPU-init only)
+// E=256 needs 203 GB GPU — exceeds B200 HBM; real DeepSeek V3 shards across GPUs.
 // ---------------------------------------------------------------------------
-constexpr int HIDDEN         = 7168;
-constexpr int FFN_INTER      = 18432;
-constexpr int NUM_EXPERTS    = 256;
-constexpr int TOP_K          = 8;
-constexpr int MAX_TOKENS     = 4096;
-constexpr int WMMA_M         = 16;
-constexpr int WMMA_N         = 16;
-constexpr int WMMA_K         = 16;
-constexpr int WARPS_PER_BLOCK  = 8;
-constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
-constexpr int TMA_BOX_M      = 64;
-constexpr int TMA_BOX_N      = 64;
-constexpr int SMEM_STAGES    = 2;
+constexpr int HIDDEN       = 7168;
+constexpr int FFN_INTER    = 18432;
+constexpr int NUM_EXPERTS  = 16;
+constexpr int TOP_K        = 8;
+constexpr int MAX_TOKENS   = 4096;
+constexpr int NAIVE_TOKENS = 32;
 
-using bf16   = __nv_bfloat16;
-
-// WMMA fragment aliases
-using FragA   = fragment<matrix_a,    WMMA_M, WMMA_N, WMMA_K, bf16, row_major>;
-using FragB   = fragment<matrix_b,    WMMA_M, WMMA_N, WMMA_K, bf16, col_major>;
-using FragAcc = fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+#define CUBLAS_CHECK(x) do { \
+    cublasStatus_t _s=(x); \
+    if(_s!=CUBLAS_STATUS_SUCCESS){ \
+        printf("cuBLAS error %d line %d\n",(int)_s,__LINE__);exit(1);} \
+} while(0)
+#define CURAND_CHECK(x) do { \
+    curandStatus_t _s=(x); \
+    if(_s!=CURAND_STATUS_SUCCESS){ \
+        printf("cuRAND error %d line %d\n",(int)_s,__LINE__);exit(1);} \
+} while(0)
+#define CUDA_CHECK(x) do { \
+    cudaError_t _e=(x); \
+    if(_e!=cudaSuccess){ \
+        printf("CUDA error %s line %d\n",cudaGetErrorString(_e),__LINE__);exit(1);} \
+} while(0)
 
 // ---------------------------------------------------------------------------
-// Router kernel
+// GPU-side random init: fill bf16 buffer using cuRAND float + cast kernel
+// Avoids allocating large host vectors (which OOM the CPU container)
+// ---------------------------------------------------------------------------
+__global__ void float_to_bf16_kernel(const float* src, bf16* dst, int n, float scale, float bias) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<n) dst[i] = __float2bfloat16(src[i]*scale+bias);
+}
+
+// Forward declaration
+void progress(int step, int total, const char* label);
+
+void gpu_rand_bf16(curandGenerator_t gen, bf16* dst, size_t n, float scale, float bias) {
+    float* tmp; CUDA_CHECK(cudaMalloc(&tmp, n*sizeof(float)));
+    CURAND_CHECK(curandGenerateUniform(gen, tmp, n));
+    float_to_bf16_kernel<<<(n+255)/256,256>>>(tmp,dst,(int)n,scale,bias);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(tmp);
+}
+
+void gpu_rand_float(curandGenerator_t gen, float* dst, size_t n) {
+    CURAND_CHECK(curandGenerateUniform(gen, dst, n));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ---------------------------------------------------------------------------
+// Router
 // ---------------------------------------------------------------------------
 __global__ void router_kernel(
     const float* __restrict__ logits,
-    int*   __restrict__ expert_ids,
-    float* __restrict__ scores,
+    int* __restrict__ expert_ids, float* __restrict__ scores,
     int T, int E, int K
 ) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= T) return;
-    const float* row = logits + t * E;
-
-    int   top_idx[TOP_K];
-    float top_val[TOP_K];
-    for (int k = 0; k < K; ++k) { top_idx[k] = k; top_val[k] = row[k]; }
-    for (int e = K; e < E; ++e) {
-        float v = row[e];
-        int   min_k = 0; float min_v = top_val[0];
-        for (int k = 1; k < K; ++k) if (top_val[k] < min_v) { min_v = top_val[k]; min_k = k; }
-        if (v > min_v) { top_val[min_k] = v; top_idx[min_k] = e; }
+    int t = blockIdx.x*blockDim.x+threadIdx.x;
+    if (t>=T) return;
+    const float* row = logits+t*E;
+    int   top_idx[8]; float top_val[8];
+    for(int k=0;k<K;++k){top_idx[k]=k;top_val[k]=row[k];}
+    for(int e=K;e<E;++e){
+        float v=row[e]; int mk=0; float mv=top_val[0];
+        for(int k=1;k<K;++k) if(top_val[k]<mv){mv=top_val[k];mk=k;}
+        if(v>mv){top_val[mk]=v;top_idx[mk]=e;}
     }
-    float sum = 0.f;
-    for (int k = 0; k < K; ++k) sum += expf(top_val[k]);
-    for (int k = 0; k < K; ++k) {
-        expert_ids[t * K + k] = top_idx[k];
-        scores    [t * K + k] = expf(top_val[k]) / sum;
+    float sum=0.f;
+    for(int k=0;k<K;++k) sum+=expf(top_val[k]);
+    for(int k=0;k<K;++k){
+        expert_ids[t*K+k]=top_idx[k];
+        scores[t*K+k]=expf(top_val[k])/(sum+1e-12f);
     }
 }
 
 // ---------------------------------------------------------------------------
-// WMMA MoE expert kernel (gate + up fused, SiLU, down)
+// Gather / Scatter / SiLU
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2)
-moe_expert_fused_kernel(
-    const bf16*  __restrict__ X,
-    const int*   __restrict__ expert_ids,
-    const float* __restrict__ scores,
-    const int*   __restrict__ expert_token_offsets,
-    const int*   __restrict__ token_idx_for_expert,
-    const bf16*  __restrict__ W1,
-    const bf16*  __restrict__ W2,
-    const bf16*  __restrict__ W3,
-    float*       __restrict__ Y,
-    int tokens_total, int hidden, int ffn_inter
+__global__ void gather_kernel(
+    const bf16* __restrict__ X, const int* __restrict__ tok_idx,
+    bf16* __restrict__ out, int H, int n
 ) {
-    const int expert_id  = blockIdx.x;
-    const int tile_row   = blockIdx.y;
-    const int tok_start  = expert_token_offsets[expert_id];
-    const int tok_end    = expert_token_offsets[expert_id + 1];
-    const int num_tokens = tok_end - tok_start;
-    const int m_base     = tile_row * TMA_BOX_M;
-    if (m_base >= num_tokens) return;
-    const int m_this     = min(TMA_BOX_M, num_tokens - m_base);
-    const int warp_id    = threadIdx.x / 32;
-    const int lane_id    = threadIdx.x % 32;
+    int i=blockIdx.x; if(i>=n) return;
+    int tok=tok_idx[i];
+    for(int h=threadIdx.x;h<H;h+=blockDim.x)
+        out[(size_t)i*H+h]=X[(size_t)tok*H+h];
+}
 
-    extern __shared__ char smem_raw[];
+__global__ void silu_gate_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    bf16* __restrict__ mid, int n
+) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n) return;
+    float g=gate[i],u=up[i];
+    mid[i]=__float2bfloat16((g/(1.f+expf(-g)))*u);
+}
 
-    bf16*  smem_A  = reinterpret_cast<bf16*>(smem_raw);
-    bf16*  smem_B1 = smem_A  + SMEM_STAGES * TMA_BOX_M * WMMA_K;
-    bf16*  smem_B2 = smem_B1 + SMEM_STAGES * TMA_BOX_N * WMMA_K;
-    float* smem_C1 = reinterpret_cast<float*>(smem_B2 + SMEM_STAGES * TMA_BOX_N * WMMA_K);
-    float* smem_C2 = smem_C1 + TMA_BOX_M * TMA_BOX_N;
-    bf16*  smem_H  = reinterpret_cast<bf16*>(smem_C2 + TMA_BOX_M * TMA_BOX_N);
-
-    constexpr int K_TILES = TMA_BOX_N / WMMA_N;   // 4
-    constexpr int M_TILES = TMA_BOX_M / WMMA_M;   // 4
-
-    FragAcc acc_gate[M_TILES][K_TILES];
-    FragAcc acc_up  [M_TILES][K_TILES];
-    FragAcc acc_down[M_TILES][K_TILES];
-    #pragma unroll
-    for (int m = 0; m < M_TILES; ++m)
-        for (int n = 0; n < K_TILES; ++n) {
-            fill_fragment(acc_gate[m][n], 0.f);
-            fill_fragment(acc_up  [m][n], 0.f);
-            fill_fragment(acc_down[m][n], 0.f);
-        }
-
-    const int num_k_chunks = (hidden + WMMA_K - 1) / WMMA_K;
-
-    // Phase 1: gate + up projections with cp.async double-buffering
-    for (int k = 0; k < num_k_chunks; ++k) {
-        int cur_s  = k % SMEM_STAGES;
-        int k_off  = k * WMMA_K;
-        int n_band = warp_id * TMA_BOX_N;
-
-        // Load X rows (gather by token index)
-        if (warp_id == 0) {
-            for (int row = lane_id; row < m_this; row += 32) {
-                int tok = token_idx_for_expert[tok_start + m_base + row];
-                const bf16* src = X + (size_t)tok * hidden + k_off;
-                bf16*       dst = smem_A + cur_s * TMA_BOX_M * WMMA_K + row * WMMA_K;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 32;"
-                             :: "l"(dst), "l"(src));
-            }
-        }
-        // Load W1 gate tile
-        if (warp_id == 1) {
-            for (int row = lane_id; row < TMA_BOX_N; row += 32) {
-                const bf16* src = W1 + (size_t)expert_id * ffn_inter * hidden + (n_band + row) * hidden + k_off;
-                bf16*       dst = smem_B1 + cur_s * TMA_BOX_N * WMMA_K + row * WMMA_K;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 32;"
-                             :: "l"(dst), "l"(src));
-            }
-        }
-        // Load W2 up tile
-        if (warp_id == 2) {
-            for (int row = lane_id; row < TMA_BOX_N; row += 32) {
-                const bf16* src = W2 + (size_t)expert_id * ffn_inter * hidden + (n_band + row) * hidden + k_off;
-                bf16*       dst = smem_B2 + cur_s * TMA_BOX_N * WMMA_K + row * WMMA_K;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 32;"
-                             :: "l"(dst), "l"(src));
-            }
-        }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
-
-        // WMMA MMA for gate and up
-        bf16* A_ptr  = smem_A  + cur_s * TMA_BOX_M * WMMA_K;
-        bf16* B1_ptr = smem_B1 + cur_s * TMA_BOX_N * WMMA_K;
-        bf16* B2_ptr = smem_B2 + cur_s * TMA_BOX_N * WMMA_K;
-        #pragma unroll
-        for (int mt = 0; mt < M_TILES; ++mt) {
-            FragA frag_a;
-            load_matrix_sync(frag_a, A_ptr + mt * WMMA_M * WMMA_K, WMMA_K);
-            #pragma unroll
-            for (int nt = 0; nt < K_TILES; ++nt) {
-                FragB fb1, fb2;
-                load_matrix_sync(fb1, B1_ptr + nt * WMMA_N * WMMA_K, WMMA_K);
-                load_matrix_sync(fb2, B2_ptr + nt * WMMA_N * WMMA_K, WMMA_K);
-                mma_sync(acc_gate[mt][nt], frag_a, fb1, acc_gate[mt][nt]);
-                mma_sync(acc_up  [mt][nt], frag_a, fb2, acc_up  [mt][nt]);
-            }
-        }
-        __syncthreads();
-    }
-
-    // Store gate/up accumulators and fuse SiLU-gate
-    #pragma unroll
-    for (int mt = 0; mt < M_TILES; ++mt)
-        for (int nt = 0; nt < K_TILES; ++nt) {
-            store_matrix_sync(smem_C1 + mt * WMMA_M * TMA_BOX_N + nt * WMMA_N, acc_gate[mt][nt], TMA_BOX_N, mem_row_major);
-            store_matrix_sync(smem_C2 + mt * WMMA_M * TMA_BOX_N + nt * WMMA_N, acc_up  [mt][nt], TMA_BOX_N, mem_row_major);
-        }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < TMA_BOX_M * TMA_BOX_N; i += THREADS_PER_BLOCK) {
-        float g = smem_C1[i];
-        float u = smem_C2[i];
-        smem_H[i] = __float2bfloat16((g / (1.f + expf(-g))) * u);
-    }
-    __syncthreads();
-
-    // Phase 2: down projection
-    const int num_k2 = (ffn_inter + WMMA_K - 1) / WMMA_K;
-    bf16* smem_B3 = smem_B1;  // reuse slot
-
-    for (int k = 0; k < num_k2; ++k) {
-        int cur_s = k % SMEM_STAGES;
-        int k_off = k * WMMA_K;
-        int n_band = warp_id * TMA_BOX_N;
-
-        if (warp_id == 0) {
-            for (int row = lane_id; row < TMA_BOX_N; row += 32) {
-                const bf16* src = W3 + (size_t)expert_id * hidden * ffn_inter + (n_band + row) * ffn_inter + k_off;
-                bf16*       dst = smem_B3 + cur_s * TMA_BOX_N * WMMA_K + row * WMMA_K;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 32;"
-                             :: "l"(dst), "l"(src));
-            }
-        }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
-
-        bf16* H_ptr  = smem_H  + k_off;
-        bf16* B3_ptr = smem_B3 + cur_s * TMA_BOX_N * WMMA_K;
-        #pragma unroll
-        for (int mt = 0; mt < M_TILES; ++mt) {
-            FragA frag_h;
-            load_matrix_sync(frag_h, H_ptr + mt * WMMA_M * ffn_inter, ffn_inter);
-            #pragma unroll
-            for (int nt = 0; nt < K_TILES; ++nt) {
-                FragB fb3;
-                load_matrix_sync(fb3, B3_ptr + nt * WMMA_N * WMMA_K, WMMA_K);
-                mma_sync(acc_down[mt][nt], frag_h, fb3, acc_down[mt][nt]);
-            }
-        }
-        __syncthreads();
-    }
-
-    // Store down result and scatter-add to output
-    #pragma unroll
-    for (int mt = 0; mt < M_TILES; ++mt)
-        for (int nt = 0; nt < K_TILES; ++nt)
-            store_matrix_sync(smem_C1 + mt * WMMA_M * TMA_BOX_N + nt * WMMA_N, acc_down[mt][nt], TMA_BOX_N, mem_row_major);
-    __syncthreads();
-
-    int warp_n_base = (warp_id % 4) * WMMA_N;
-    int warp_m_base = (warp_id / 4) * WMMA_M;
-    for (int elem = lane_id; elem < WMMA_M * WMMA_N; elem += 32) {
-        int lm = elem / WMMA_N, ln = elem % WMMA_N;
-        int gm = m_base + warp_m_base + lm;
-        int gn = warp_n_base + ln;
-        if (gm >= num_tokens || gn >= hidden) continue;
-        int   tok   = token_idx_for_expert[tok_start + gm];
-        float score = scores[tok * TOP_K];   // simplified slot 0
-        float val   = smem_C1[(warp_m_base + lm) * TMA_BOX_N + warp_n_base + ln] * score;
-        atomicAdd(&Y[(size_t)tok * hidden + gn], val);
-    }
+__global__ void scatter_add_kernel(
+    const float* __restrict__ out, const int* __restrict__ tok_idx,
+    const float* __restrict__ scores_flat,
+    float* __restrict__ Y, int H, int n
+) {
+    int i=blockIdx.x; if(i>=n) return;
+    int   tok  =tok_idx[i];
+    float score=scores_flat[i];
+    for(int h=threadIdx.x;h<H;h+=blockDim.x)
+        atomicAdd(&Y[(size_t)tok*H+h], out[(size_t)i*H+h]*score);
 }
 
 // ---------------------------------------------------------------------------
 // Naive baseline
 // ---------------------------------------------------------------------------
 __global__ void moe_naive_kernel(
-    const bf16* X, const int* expert_ids, const float* scores,
-    const int* expert_token_offsets, const int* token_idx_for_expert,
-    const bf16* W1, const bf16* W2, const bf16* W3,
-    float* Y, int tokens_total, int hidden, int ffn_inter
+    const bf16* __restrict__ X, const int* __restrict__ expert_ids,
+    const float* __restrict__ scores,
+    const bf16* __restrict__ W1, const bf16* __restrict__ W2,
+    const bf16* __restrict__ W3, float* __restrict__ Y,
+    int T, int H, int I, int K
 ) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= tokens_total) return;
-    for (int k = 0; k < TOP_K; ++k) {
-        int   e  = expert_ids[t * TOP_K + k];
-        float sc = scores    [t * TOP_K + k];
-        for (int n = 0; n < ffn_inter; ++n) {
-            float gate = 0.f, up = 0.f;
-            for (int h = 0; h < hidden; ++h) {
-                float xv = __bfloat162float(X[t * hidden + h]);
-                gate += xv * __bfloat162float(W1[(size_t)e * ffn_inter * hidden + n * hidden + h]);
-                up   += xv * __bfloat162float(W2[(size_t)e * ffn_inter * hidden + n * hidden + h]);
+    int t=blockIdx.x*blockDim.x+threadIdx.x;
+    if(t>=T) return;
+    for(int k=0;k<K;++k){
+        int   e =expert_ids[t*K+k];
+        float sc=scores    [t*K+k];
+        for(int n=0;n<I;++n){
+            float gate=0.f,up=0.f;
+            for(int h=0;h<H;++h){
+                float xv=__bfloat162float(X[t*H+h]);
+                gate+=xv*__bfloat162float(W1[(size_t)e*I*H+n*H+h]);
+                up  +=xv*__bfloat162float(W2[(size_t)e*I*H+n*H+h]);
             }
-            float hv = (gate / (1.f + expf(-gate))) * up;
-            for (int o = 0; o < hidden; ++o)
-                atomicAdd(&Y[t * hidden + o],
-                    sc * hv * __bfloat162float(W3[(size_t)e * hidden * ffn_inter + o * ffn_inter + n]));
+            float hv=(gate/(1.f+expf(-gate)))*up;
+            for(int o=0;o<H;++o)
+                atomicAdd(&Y[t*H+o],
+                    sc*hv*__bfloat162float(W3[(size_t)e*H*I+o*I+n]));
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark helper
+// Routing table (device->host->device, small arrays only)
 // ---------------------------------------------------------------------------
-struct BenchResult { double ms; double tflops; };
-
-BenchResult bench(const char* name, std::function<void()> fn, int warmup=3, int iters=10) {
-    for (int i = 0; i < warmup; ++i) fn();
-    cudaDeviceSynchronize();
-    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
-    std::vector<float> times;
-    for (int i = 0; i < iters; ++i) {
-        cudaEventRecord(t0); fn(); cudaEventRecord(t1);
-        cudaEventSynchronize(t1);
-        float ms; cudaEventElapsedTime(&ms, t0, t1); times.push_back(ms);
-    }
-    double mean = std::accumulate(times.begin(), times.end(), 0.0) / iters;
-    double flops = 2.0 * 2.0 * MAX_TOKENS * TOP_K * (double)HIDDEN * FFN_INTER;
-    double tflops = flops / (mean * 1e-3) / 1e12;
-    printf("%-38s  mean=%8.2f ms   TFLOPs=%7.2f\n", name, mean, tflops);
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
-    return {mean, tflops};
+void build_routing(
+    int* d_eids,int* d_offs,int* d_tidx,
+    float* d_scores,float* d_scores_flat,
+    int T,int K,int E,std::vector<int>& h_offs
+){
+    std::vector<int>   he(T*K); std::vector<float> hs(T*K);
+    cudaMemcpy(he.data(),d_eids,  T*K*sizeof(int),  cudaMemcpyDeviceToHost);
+    cudaMemcpy(hs.data(),d_scores,T*K*sizeof(float),cudaMemcpyDeviceToHost);
+    std::vector<int> cnt(E,0);
+    for(int id:he) cnt[id]++;
+    h_offs.resize(E+1,0);
+    for(int e=0;e<E;++e) h_offs[e+1]=h_offs[e]+cnt[e];
+    std::vector<int>   idx(T*K);
+    std::vector<float> sflt(T*K);
+    std::vector<int>   cur(h_offs.begin(),h_offs.end());
+    for(int t=0;t<T;++t)
+        for(int k=0;k<K;++k){
+            int e=he[t*K+k],pos=cur[e]++;
+            idx[pos]=t; sflt[pos]=hs[t*K+k];
+        }
+    cudaMemcpy(d_offs, h_offs.data(),(E+1)*sizeof(int),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_tidx, idx.data(),   T*K *sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_scores_flat,sflt.data(),T*K*sizeof(float),cudaMemcpyHostToDevice);
 }
 
 // ---------------------------------------------------------------------------
-// main
+// cuBLAS MoE forward (expert-serial, shared per-expert scratch)
 // ---------------------------------------------------------------------------
-int main() {
-    printf("=== DeepSeek MoE: WMMA+TMA vs Naive (B200) ===\n\n");
-    printf("tokens=%d  hidden=%d  ffn_inter=%d  experts=%d  top_k=%d\n\n",
-           MAX_TOKENS, HIDDEN, FFN_INTER, NUM_EXPERTS, TOP_K);
-
-    size_t X_sz  = (size_t)MAX_TOKENS * HIDDEN * sizeof(bf16);
-    size_t W1_sz = (size_t)NUM_EXPERTS * FFN_INTER * HIDDEN * sizeof(bf16);
-    size_t W3_sz = (size_t)NUM_EXPERTS * HIDDEN * FFN_INTER * sizeof(bf16);
-    size_t Y_sz  = (size_t)MAX_TOKENS * HIDDEN * sizeof(float);
-    size_t lg_sz = (size_t)MAX_TOKENS * NUM_EXPERTS * sizeof(float);
-
-    bf16   *d_X, *d_W1, *d_W2, *d_W3;
-    float  *d_Y, *d_logits, *d_scores;
-    int    *d_eids, *d_offs, *d_tidx;
-
-    cudaMalloc(&d_X,      X_sz);   cudaMalloc(&d_W1, W1_sz);
-    cudaMalloc(&d_W2,     W1_sz);  cudaMalloc(&d_W3, W3_sz);
-    cudaMalloc(&d_Y,      Y_sz);   cudaMalloc(&d_logits, lg_sz);
-    cudaMalloc(&d_scores, (size_t)MAX_TOKENS * TOP_K * sizeof(float));
-    cudaMalloc(&d_eids,   (size_t)MAX_TOKENS * TOP_K * sizeof(int));
-    cudaMalloc(&d_offs,   (NUM_EXPERTS + 1) * sizeof(int));
-    cudaMalloc(&d_tidx,   (size_t)MAX_TOKENS * TOP_K * sizeof(int));
-
-    // Random init
-    {
-        srand(42);
-        std::vector<bf16> h(MAX_TOKENS * HIDDEN);
-        for (auto& v : h) v = __float2bfloat16((float)rand()/RAND_MAX - 0.5f);
-        cudaMemcpy(d_X, h.data(), X_sz, cudaMemcpyHostToDevice);
-
-        std::vector<bf16> w(NUM_EXPERTS * FFN_INTER * HIDDEN);
-        for (auto& v : w) v = __float2bfloat16((float)rand()/RAND_MAX * 0.02f);
-        cudaMemcpy(d_W1, w.data(), W1_sz, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_W2, w.data(), W1_sz, cudaMemcpyHostToDevice);
-
-        std::vector<bf16> w3(NUM_EXPERTS * HIDDEN * FFN_INTER);
-        for (auto& v : w3) v = __float2bfloat16((float)rand()/RAND_MAX * 0.02f);
-        cudaMemcpy(d_W3, w3.data(), W3_sz, cudaMemcpyHostToDevice);
-
-        std::vector<float> lg(MAX_TOKENS * NUM_EXPERTS);
-        for (auto& v : lg) v = (float)rand()/RAND_MAX;
-        cudaMemcpy(d_logits, lg.data(), lg_sz, cudaMemcpyHostToDevice);
+void cublas_moe_fwd(
+    cublasHandle_t handle,
+    const bf16* d_X,const int* d_tidx,const float* d_scf,
+    const bf16* d_W1,const bf16* d_W2,const bf16* d_W3,
+    float* d_Y,
+    bf16* d_Xe,float* d_gate,float* d_up,bf16* d_mid,float* d_out,
+    const std::vector<int>& h_offs,
+    int T,int H,int I,int K,int E,bool show_progress=false
+){
+    const float al=1.f,be=0.f;
+    for(int e=0;e<E;++e){
+        int n=h_offs[e+1]-h_offs[e]; if(!n) continue;
+        const int*   tidx=d_tidx+h_offs[e];
+        const float* sflt=d_scf +h_offs[e];
+        const bf16* Wg=d_W1+(size_t)e*I*H;
+        const bf16* Wu=d_W2+(size_t)e*I*H;
+        const bf16* Wd=d_W3+(size_t)e*H*I;
+        gather_kernel<<<n,min(H,256)>>>(d_X,tidx,d_Xe,H,n);
+        CUBLAS_CHECK(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,I,n,H,&al,
+            Wg,CUDA_R_16BF,H,d_Xe,CUDA_R_16BF,H,&be,d_gate,CUDA_R_32F,I,
+            CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUBLAS_CHECK(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,I,n,H,&al,
+            Wu,CUDA_R_16BF,H,d_Xe,CUDA_R_16BF,H,&be,d_up,CUDA_R_32F,I,
+            CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        silu_gate_kernel<<<(n*I+255)/256,256>>>(d_gate,d_up,d_mid,n*I);
+        CUBLAS_CHECK(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,H,n,I,&al,
+            Wd,CUDA_R_16BF,I,d_mid,CUDA_R_16BF,I,&be,d_out,CUDA_R_32F,H,
+            CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        scatter_add_kernel<<<n,min(H,256)>>>(d_out,tidx,sflt,d_Y,H,n);
+        if(show_progress) progress(e+1, E, "running experts");
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
 
-    // Router
-    router_kernel<<<(MAX_TOKENS+255)/256, 256>>>(
-        d_logits, d_eids, d_scores, MAX_TOKENS, NUM_EXPERTS, TOP_K);
-    cudaDeviceSynchronize();
-
-    // Build CSR expert→token map on host
-    {
-        std::vector<int> h_eids(MAX_TOKENS * TOP_K);
-        cudaMemcpy(h_eids.data(), d_eids, h_eids.size()*sizeof(int), cudaMemcpyDeviceToHost);
-        std::vector<int> cnt(NUM_EXPERTS, 0);
-        for (int id : h_eids) cnt[id]++;
-        std::vector<int> offs(NUM_EXPERTS + 1, 0);
-        for (int e = 0; e < NUM_EXPERTS; ++e) offs[e+1] = offs[e] + cnt[e];
-        std::vector<int> idx(MAX_TOKENS * TOP_K);
-        std::vector<int> cur(offs.begin(), offs.end());
-        for (int t = 0; t < MAX_TOKENS; ++t)
-            for (int k = 0; k < TOP_K; ++k)
-                idx[cur[h_eids[t*TOP_K+k]]++] = t;
-        cudaMemcpy(d_offs, offs.data(), offs.size()*sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_tidx, idx.data(),  idx.size() *sizeof(int), cudaMemcpyHostToDevice);
+// ---------------------------------------------------------------------------
+// Benchmark helper
+// ---------------------------------------------------------------------------
+struct BR{double ms,tflops;};
+BR bench(const char* lbl,std::function<void()> fn,int wu,int iters,double flops=0){
+    printf("  %s\n",lbl); fflush(stdout);
+    int total = wu + iters;
+    for(int i=0;i<wu;++i){
+        progress(i, total, "warmup");
+        fn(); cudaDeviceSynchronize();
     }
+    cudaEvent_t t0,t1; cudaEventCreate(&t0);cudaEventCreate(&t1);
+    std::vector<float> ts;
+    for(int i=0;i<iters;++i){
+        progress(wu+i, total, "benchmarking");
+        cudaEventRecord(t0);fn();cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms;cudaEventElapsedTime(&ms,t0,t1);ts.push_back(ms);
+    }
+    progress(total, total, "done");
+    cudaEventDestroy(t0);cudaEventDestroy(t1);
+    double mean=std::accumulate(ts.begin(),ts.end(),0.)/iters;
+    double tf=flops>0?flops/(mean*1e-3)/1e12:0;
+    if(flops>0) printf("  -> %.2f ms   %.3f TFLOPs\n",mean,tf);
+    else        printf("  -> %.2f ms\n",mean);
+    fflush(stdout);
+    return {mean,tf};
+}
 
-    // Shared memory size
-    const size_t smem_sz =
-        SMEM_STAGES * TMA_BOX_M * WMMA_K * sizeof(bf16)  +
-        SMEM_STAGES * TMA_BOX_N * WMMA_K * sizeof(bf16)  +
-        SMEM_STAGES * TMA_BOX_N * WMMA_K * sizeof(bf16)  +
-        TMA_BOX_M * TMA_BOX_N * sizeof(float)            +
-        TMA_BOX_M * TMA_BOX_N * sizeof(float)            +
-        TMA_BOX_M * TMA_BOX_N * sizeof(bf16);
+// ---------------------------------------------------------------------------
+// Progress bar: prints  [=====>    ] 55%  label
+// Call with step=0..total; step==total prints newline
+// ---------------------------------------------------------------------------
+void progress(int step, int total, const char* label) {
+    int width = 30;
+    int filled = (step * width) / total;
+    int pct    = (step * 100) / total;
+    printf("\r  [");
+    for (int i=0;i<width;++i) printf(i<filled?"=": (i==filled?">": " "));
+    printf("] %3d%%  %s", pct, label);
+    if (step==total) printf("\n");
+    fflush(stdout);
+}
 
-    cudaFuncSetAttribute(moe_expert_fused_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_sz);
+// ===========================================================================
+// CORRECTNESS TEST  (small dims, CPU-safe init)
+// ===========================================================================
+bool correctness_test(){
+    printf("\n=== CORRECTNESS TEST ===\n");
+    // Small enough that host vectors are fine (~8 MB each)
+    const int T=32,H=64,I=128,K=2,E=4;
+    printf("  dims: T=%d H=%d I=%d E=%d K=%d\n",T,H,I,E,K);
 
-    const int max_tpe    = (MAX_TOKENS * TOP_K + NUM_EXPERTS - 1) / NUM_EXPERTS;
-    const int m_tiles    = (max_tpe + TMA_BOX_M - 1) / TMA_BOX_M;
-    dim3 grid_w(NUM_EXPERTS, m_tiles);
-    dim3 block(THREADS_PER_BLOCK);
+    bf16 *dX,*dW1,*dW2,*dW3,*dXe,*dMid;
+    float *dYc,*dYn,*dLg,*dSc,*dScf,*dGate,*dUp,*dOut;
+    int *dEids,*dOffs,*dTidx;
+    int mtp=T*K;
 
-    auto run_wmma = [&]() {
-        cudaMemset(d_Y, 0, Y_sz);
-        moe_expert_fused_kernel<<<grid_w, block, smem_sz>>>(
-            d_X, d_eids, d_scores, d_offs, d_tidx,
-            d_W1, d_W2, d_W3, d_Y,
-            MAX_TOKENS, HIDDEN, FFN_INTER);
+    CUDA_CHECK(cudaMalloc(&dX,  (size_t)T*H*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW1, (size_t)E*I*H*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW2, (size_t)E*I*H*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW3, (size_t)E*H*I*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dYc, (size_t)T*H*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dYn, (size_t)T*H*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dLg, (size_t)T*E*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSc, (size_t)T*K*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dScf,(size_t)T*K*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dEids,(size_t)T*K*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dOffs,(E+1)*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dTidx,(size_t)T*K*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dXe,  (size_t)mtp*H*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dGate,(size_t)mtp*I*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dUp,  (size_t)mtp*I*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dMid, (size_t)mtp*I*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dOut, (size_t)mtp*H*sizeof(float)));
+
+    // Small arrays — host init is fine
+    srand(42);
+    auto rb=[](){return __float2bfloat16((float)rand()/RAND_MAX*.2f-.1f);};
+    auto rf=[](){return (float)rand()/RAND_MAX;};
+    std::vector<bf16> hX(T*H),hW1(E*I*H),hW2(E*I*H),hW3(E*H*I);
+    std::vector<float> hLg(T*E);
+    for(auto&v:hX)  v=rb(); for(auto&v:hW1)v=rb();
+    for(auto&v:hW2) v=rb(); for(auto&v:hW3)v=rb();
+    for(auto&v:hLg) v=rf();
+    cudaMemcpy(dX, hX.data(), hX.size()*sizeof(bf16),  cudaMemcpyHostToDevice);
+    cudaMemcpy(dW1,hW1.data(),hW1.size()*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(dW2,hW2.data(),hW2.size()*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(dW3,hW3.data(),hW3.size()*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(dLg,hLg.data(),hLg.size()*sizeof(float),cudaMemcpyHostToDevice);
+
+    router_kernel<<<(T+255)/256,256>>>(dLg,dEids,dSc,T,E,K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<int> h_offs;
+    build_routing(dEids,dOffs,dTidx,dSc,dScf,T,K,E,h_offs);
+
+    cublasHandle_t h; cublasCreate(&h);
+
+    // cuBLAS run
+    CUDA_CHECK(cudaMemset(dYc,0,(size_t)T*H*sizeof(float)));
+    cublas_moe_fwd(h,dX,dTidx,dScf,dW1,dW2,dW3,dYc,
+                   dXe,dGate,dUp,dMid,dOut,h_offs,T,H,I,K,E);
+
+    // Naive run
+    CUDA_CHECK(cudaMemset(dYn,0,(size_t)T*H*sizeof(float)));
+    moe_naive_kernel<<<(T+255)/256,256>>>(dX,dEids,dSc,dW1,dW2,dW3,dYn,T,H,I,K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> hYc(T*H),hYn(T*H);
+    cudaMemcpy(hYc.data(),dYc,T*H*sizeof(float),cudaMemcpyDeviceToHost);
+    cudaMemcpy(hYn.data(),dYn,T*H*sizeof(float),cudaMemcpyDeviceToHost);
+
+    double maxe=0,meane=0; int nz=0;
+    for(int i=0;i<T*H;++i){
+        double ref=fabs((double)hYn[i]);
+        if(ref<1e-6) continue;
+        double rel=fabs((double)hYc[i]-(double)hYn[i])/ref;
+        if(rel>maxe)maxe=rel; meane+=rel; nz++;
+    }
+    meane/=std::max(1,nz);
+    bool ok=maxe<0.05;
+
+    printf("  max rel error : %.5f\n",maxe);
+    printf("  mean rel error: %.5f  (%d non-zero)\n",meane,nz);
+    printf("  spot check tok=0: cuBLAS[%.4f %.4f]  naive[%.4f %.4f]\n",
+           hYc[0],hYc[1],hYn[0],hYn[1]);
+    printf("  TEST %s\n",ok?"PASSED ✓":"FAILED ✗");
+
+    cublasDestroy(h);
+    cudaFree(dX);cudaFree(dW1);cudaFree(dW2);cudaFree(dW3);
+    cudaFree(dYc);cudaFree(dYn);cudaFree(dLg);cudaFree(dSc);cudaFree(dScf);
+    cudaFree(dEids);cudaFree(dOffs);cudaFree(dTidx);
+    cudaFree(dXe);cudaFree(dGate);cudaFree(dUp);cudaFree(dMid);cudaFree(dOut);
+    return ok;
+}
+
+// ===========================================================================
+// PERF BENCHMARK  (full dims, GPU-only init via cuRAND)
+// ===========================================================================
+void perf_benchmark(){
+    printf("\n=== PERF BENCHMARK ===\n");
+    printf("  H=%d I=%d E=%d K=%d T=%d\n",
+           HIDDEN,FFN_INTER,NUM_EXPERTS,TOP_K,MAX_TOKENS);
+    double wt_gb=3.*(double)NUM_EXPERTS*FFN_INTER*HIDDEN*2/1e9;
+    printf("  Weights: %.1f GB on GPU (init via cuRAND, no host alloc)\n\n",wt_gb);
+    fflush(stdout);
+
+    // All weights initialized directly on GPU — no host vectors
+    curandGenerator_t rng;
+    CURAND_CHECK(curandCreateGenerator(&rng,CURAND_RNG_PSEUDO_DEFAULT));
+    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(rng,42));
+
+    int mtp=(MAX_TOKENS*TOP_K+NUM_EXPERTS-1)/NUM_EXPERTS+64;
+
+    bf16 *dX,*dW1,*dW2,*dW3,*dXe,*dMid;
+    float *dY,*dLg,*dSc,*dScf,*dGate,*dUp,*dOut;
+    int *dEids,*dOffs,*dTidx;
+
+    printf("  Allocating GPU memory...\n"); fflush(stdout);
+    CUDA_CHECK(cudaMalloc(&dX,  (size_t)MAX_TOKENS*HIDDEN*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW1, (size_t)NUM_EXPERTS*FFN_INTER*HIDDEN*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW2, (size_t)NUM_EXPERTS*FFN_INTER*HIDDEN*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dW3, (size_t)NUM_EXPERTS*HIDDEN*FFN_INTER*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dY,  (size_t)MAX_TOKENS*HIDDEN*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dLg, (size_t)MAX_TOKENS*NUM_EXPERTS*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSc, (size_t)MAX_TOKENS*TOP_K*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dScf,(size_t)MAX_TOKENS*TOP_K*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dEids,(size_t)MAX_TOKENS*TOP_K*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dOffs,(NUM_EXPERTS+1)*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dTidx,(size_t)MAX_TOKENS*TOP_K*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dXe,  (size_t)mtp*HIDDEN*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dGate,(size_t)mtp*FFN_INTER*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dUp,  (size_t)mtp*FFN_INTER*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dMid, (size_t)mtp*FFN_INTER*sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&dOut, (size_t)mtp*HIDDEN*sizeof(float)));
+    printf("  Allocation done.\n"); fflush(stdout);
+
+    printf("  Initializing weights on GPU (cuRAND):\n"); fflush(stdout);
+    progress(0,5,"X");   gpu_rand_bf16(rng,dX, (size_t)MAX_TOKENS*HIDDEN,         1.f,-.5f);
+    progress(1,5,"W1");  gpu_rand_bf16(rng,dW1,(size_t)NUM_EXPERTS*FFN_INTER*HIDDEN,.02f,-.01f);
+    progress(2,5,"W2");  gpu_rand_bf16(rng,dW2,(size_t)NUM_EXPERTS*FFN_INTER*HIDDEN,.02f,-.01f);
+    progress(3,5,"W3");  gpu_rand_bf16(rng,dW3,(size_t)NUM_EXPERTS*HIDDEN*FFN_INTER,.02f,-.01f);
+    progress(4,5,"logits"); gpu_rand_float(rng,dLg,(size_t)MAX_TOKENS*NUM_EXPERTS);
+    progress(5,5,"done");
+
+    router_kernel<<<(MAX_TOKENS+255)/256,256>>>(
+        dLg,dEids,dSc,MAX_TOKENS,NUM_EXPERTS,TOP_K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<int> h_offs;
+    build_routing(dEids,dOffs,dTidx,dSc,dScf,
+                  MAX_TOKENS,TOP_K,NUM_EXPERTS,h_offs);
+
+    cublasHandle_t handle; cublasCreate(&handle);
+
+    double flops=2.*2.*MAX_TOKENS*TOP_K*(double)HIDDEN*FFN_INTER;
+
+    auto run_cublas=[&](){
+        CUDA_CHECK(cudaMemset(dY,0,(size_t)MAX_TOKENS*HIDDEN*sizeof(float)));
+        cublas_moe_fwd(handle,dX,dTidx,dScf,dW1,dW2,dW3,dY,
+                       dXe,dGate,dUp,dMid,dOut,h_offs,
+                       MAX_TOKENS,HIDDEN,FFN_INTER,TOP_K,NUM_EXPERTS,true);
     };
-    auto run_naive = [&]() {
-        cudaMemset(d_Y, 0, Y_sz);
-        moe_naive_kernel<<<(MAX_TOKENS+255)/256, 256>>>(
-            d_X, d_eids, d_scores, d_offs, d_tidx,
-            d_W1, d_W2, d_W3, d_Y,
-            MAX_TOKENS, HIDDEN, FFN_INTER);
+    auto run_naive=[&](){
+        CUDA_CHECK(cudaMemset(dY,0,(size_t)MAX_TOKENS*HIDDEN*sizeof(float)));
+        moe_naive_kernel<<<(NAIVE_TOKENS+255)/256,256>>>(
+            dX,dEids,dSc,dW1,dW2,dW3,dY,
+            NAIVE_TOKENS,HIDDEN,FFN_INTER,TOP_K);
+        CUDA_CHECK(cudaDeviceSynchronize());
     };
 
-    printf("Benchmarking (warmup=3, iters=10)...\n\n");
-    BenchResult rw = bench("WMMA+TMA (ThunderKittens/Blackwell)", run_wmma, 3, 10);
-    BenchResult rn = bench("Naive scalar baseline",               run_naive, 3, 10);
+    BR rc=bench("cuBLAS GemmEx (tensor cores, T=4096)",run_cublas,1,5,flops);
+    BR rn=bench("Naive scalar baseline      (T=32)",   run_naive, 0,1);
 
-    printf("\n--- Summary ---\n");
-    printf("Speedup:                 %.2fx\n",   rn.ms / rw.ms);
-    printf("WMMA+TMA TFLOPs:         %.2f\n",    rw.tflops);
-    printf("Naive    TFLOPs:         %.2f\n",    rn.tflops);
-    printf("B200 bf16 peak ~2000 TFLOPs\n");
-    printf("Roofline utilization:    %.1f%%\n",  100.0 * rw.tflops / 2000.0);
+    double extrap=rn.ms*((double)MAX_TOKENS/NAIVE_TOKENS);
+    printf("\n=== SUMMARY ===\n");
+    printf("cuBLAS tensor cores : %8.2f ms   %.3f TFLOPs  (T=%d E=%d)\n",
+           rc.ms,rc.tflops,MAX_TOKENS,NUM_EXPERTS);
+    printf("Naive scalar        : %8.2f ms              (T=%d)\n",
+           rn.ms,NAIVE_TOKENS);
+    printf("Naive extrap        : %8.2f ms   (est. T=%d)\n",extrap,MAX_TOKENS);
+    printf("Speedup             : %.1fx\n",extrap/rc.ms);
+    printf("B200 bf16 peak      : ~2000 TFLOPs\n");
+    printf("Roofline util       : %.1f%%\n",100.*rc.tflops/2000.);
+    printf("\nNote: E=16 used (E=256 needs 203 GB > B200's 192 GB HBM;\n");
+    printf("      real DeepSeek V3 shards across 32 GPUs in production)\n");
 
-    cudaFree(d_X);  cudaFree(d_W1); cudaFree(d_W2); cudaFree(d_W3);
-    cudaFree(d_Y);  cudaFree(d_logits); cudaFree(d_scores);
-    cudaFree(d_eids); cudaFree(d_offs); cudaFree(d_tidx);
-    printf("\nDone.\n");
-    return 0;
+    curandDestroyGenerator(rng);
+    cublasDestroy(handle);
+    cudaFree(dX);cudaFree(dW1);cudaFree(dW2);cudaFree(dW3);
+    cudaFree(dY);cudaFree(dLg);cudaFree(dSc);cudaFree(dScf);
+    cudaFree(dEids);cudaFree(dOffs);cudaFree(dTidx);
+    cudaFree(dXe);cudaFree(dGate);cudaFree(dUp);cudaFree(dMid);cudaFree(dOut);
+}
+
+// ===========================================================================
+int main(){
+    printf("=== DeepSeek MoE cuBLAS Benchmark [B200] ===\n"); fflush(stdout);
+    int dev; cudaGetDevice(&dev);
+    cudaDeviceProp p; cudaGetDeviceProperties(&p,dev);
+    printf("GPU: %s  SM%d.%d  %dSMs  %.0fGB HBM\n\n",
+           p.name,p.major,p.minor,p.multiProcessorCount,p.totalGlobalMem/1e9);
+    fflush(stdout);
+    bool ok=correctness_test();
+    perf_benchmark();
+    return ok?0:1;
 }
 """
 
-# ---------------------------------------------------------------------------
-# Modal image — writes the CUDA source from the string above, then compiles
-# ---------------------------------------------------------------------------
+_CUDA_SRC_B64 = _b64.b64encode(CUDA_SRC.encode()).decode()
+
+def _write_and_compile():
+    import base64, os, pathlib, subprocess, time
+    src = base64.b64decode(os.environ["CUDA_SRC_B64"]).decode()
+    pathlib.Path("/workspace").mkdir(parents=True, exist_ok=True)
+    pathlib.Path("/workspace/moe_bench.cu").write_text(src)
+    print("Compiling...", flush=True)
+    t0 = time.time()
+    r = subprocess.run([
+        "nvcc", "-O2",
+        "-gencode", "arch=compute_100a,code=sm_100a",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        "-lcublas", "-lcuda", "-lcurand",
+        "/workspace/moe_bench.cu",
+        "-o", "/workspace/moe_bench",
+    ], capture_output=True, text=True)
+    print(f"nvcc: {time.time()-t0:.1f}s", flush=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"nvcc failed:\n{r.stderr}")
+    print("OK", flush=True)
+
 cuda_image = (
     modal.Image.from_registry(
         "nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04",
@@ -445,61 +508,38 @@ cuda_image = (
     )
     .apt_install("git", "cmake", "ninja-build")
     .run_commands(
-        "git clone --depth 1 https://github.com/HazyResearch/ThunderKittens.git /opt/thunderkittens",
+        "git clone --depth 1 "
+        "https://github.com/HazyResearch/ThunderKittens.git /opt/thunderkittens",
     )
-    # Write the embedded source to disk inside the image, then compile
-    .run_commands(
-        f"cat > /workspace/deepseek_moe_wmma_tma.cu << 'ENDSRC'\n{CUDA_SRC}\nENDSRC",
-        "mkdir -p /workspace && nvcc -O3 "
-        "  -gencode arch=compute_100a,code=sm_100a "
-        "  -std=c++20 "
-        "  -I/opt/thunderkittens/include "
-        "  -lcublas -lcuda "
-        "  /workspace/deepseek_moe_wmma_tma.cu "
-        "  -o /workspace/moe_bench",
-    )
+    .env({"CUDA_SRC_B64": _CUDA_SRC_B64})
+    .run_function(_write_and_compile)
 )
 
-app = modal.App("deepseek-moe-wmma-tma")
+app = modal.App("deepseek-moe-cublas-b200")
 
-# ---------------------------------------------------------------------------
-# Benchmark function
-# ---------------------------------------------------------------------------
-@app.function(
-    gpu="B200",
-    image=cuda_image,
-    timeout=600,
-    memory=65536,
-)
+@app.function(gpu="B200", image=cuda_image, timeout=300, memory=32768)
 def run_bench() -> str:
     import subprocess, sys
-    result = subprocess.run(["/workspace/moe_bench"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print("STDERR:\n", result.stderr, file=sys.stderr)
-        raise RuntimeError(f"moe_bench exited {result.returncode}")
-    return result.stdout
+    r = subprocess.run(
+        ["/workspace/moe_bench"], capture_output=True, text=True, timeout=240)
+    if r.returncode not in (0,1):
+        print("STDOUT:\n", r.stdout)
+        print("STDERR:\n", r.stderr, file=sys.stderr)
+        raise RuntimeError(f"crashed (exit {r.returncode})")
+    return r.stdout
 
-
-# ---------------------------------------------------------------------------
-# GPU info helper
-# ---------------------------------------------------------------------------
-@app.function(gpu="B200", image=cuda_image, timeout=120)
+@app.function(gpu="B200", image=cuda_image, timeout=60)
 def check_gpu_info() -> str:
     import subprocess
     r = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+        ["nvidia-smi","--query-gpu=name,memory.total,driver_version",
          "--format=csv,noheader"],
-        capture_output=True, text=True,
-    )
+        capture_output=True, text=True)
     return r.stdout.strip()
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main():
-    print("=== GPU info ===")
+    print("=== GPU Info ===")
     print(check_gpu_info.remote())
     print()
     print("=== Benchmark ===")
